@@ -8,7 +8,7 @@ private let syncLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", categor
 /// triggers the next request.
 ///
 /// Stage order (per `docs/ColmiR02-Protocol.md` §5):
-///   activity(0..7) → HR(0..7) → stress → spo2(bigdata) → sleep(bigdata) → hrv(0..6)
+///   activity(0..7) → HR(0..7) → stress(0..6) → spo2(bigdata) → sleep(bigdata) → hrv(0..6)
 ///   → temperature(bigdata) → done.
 ///
 /// **UNVERIFIED (GadgetBridge-derived):** exact reply→stage transitions, per-day iteration counts,
@@ -57,6 +57,12 @@ final class ColmiSyncEngine: RingSyncEngine {
     private var pagedHeader: ColmiPagedHistoryHeader?
     /// The midnight of the day currently being synced (for HR/stress/HRV sample timestamps).
     private var syncDay = Calendar.current.startOfDay(for: Date())
+    /// Set when a past stress day's packet 1 echoes a different day offset than we asked for — i.e. the
+    /// firmware ignored the offset and is replaying another day. That day's samples are dropped and the
+    /// stress walk-back stops, so nothing is filed under the wrong date.
+    private var stressDayRejected = false
+    /// How many past days of stress to request after today (HRV uses the same window).
+    static let stressPastDays = 6
     /// A targeted post-workout run: today's HR log → SpO2 big-data → done, skipping the other five
     /// stages. Set by `startVitalsBackfill()`, cleared whenever a run finishes or a full sync starts.
     private var isVitalsBackfill = false
@@ -196,7 +202,7 @@ final class ColmiSyncEngine: RingSyncEngine {
             daysAgo = 0; stage = .heartRate; requestHeartRate()
         case .heartRate:
             if isVitalsBackfill { stage = .spo2; requestSpo2() }
-            else { stage = .stress; requestStress() }
+            else { daysAgo = 0; stage = .stress; requestStress() }
         case .stress:
             stage = .spo2; requestSpo2()
         case .spo2:
@@ -233,9 +239,10 @@ final class ColmiSyncEngine: RingSyncEngine {
     }
 
     private func requestStress() {
-        syncDay = calendar.startOfDay(for: Date())
+        syncDay = dayStart(daysAgo)
         pagedHeader = nil
-        writer?.enqueue(Data(encoder.syncStress()))
+        stressDayRejected = false
+        writer?.enqueue(Data(encoder.syncStress(daysAgo: daysAgo)))
     }
 
     private func requestHRV() {
@@ -259,7 +266,17 @@ final class ColmiSyncEngine: RingSyncEngine {
     func handleHistoryFrame(_ data: Data) -> [RingDecodedEvent] {
         if let header = ColmiPagedHistoryHeader(data) { pagedHeader = header }
         let interval = (pagedHeader?.opcode == data.first) ? pagedHeader?.intervalMinutes : nil
-        let events = decoder.decodeHistory(data, day: syncDay, calendar: calendar, intervalMinutes: interval)
+        let bytes = [UInt8](data.prefix(3))
+        if stage == .stress, daysAgo > 0, bytes.count == 3, bytes[0] == ColmiCommandID.syncStress,
+           bytes[1] == 1, bytes[2] != UInt8(clamping: daysAgo) {
+            let echoed = Int(bytes[2])
+            syncLog.info("stress day \(self.daysAgo) echoed offset \(echoed); firmware ignores the day offset")
+            stressDayRejected = true
+        }
+        let isRejectedStressDay = stage == .stress && stressDayRejected && data.first == ColmiCommandID.syncStress
+        let events = isRejectedStressDay
+            ? []
+            : decoder.decodeHistory(data, day: syncDay, calendar: calendar, intervalMinutes: interval)
         advanceAfterPagedFrame(data)
         armWatchdog()   // progress made — reset the stall timer
         return events
@@ -310,9 +327,10 @@ final class ColmiSyncEngine: RingSyncEngine {
         case .heartRate:
             if isVitalsBackfill { stage = .spo2; requestSpo2() }
             else if daysAgo < 7 { daysAgo += 1; requestHeartRate() }
-            else { stage = .stress; requestStress() }
+            else { daysAgo = 0; stage = .stress; requestStress() }
         case .stress:
-            stage = .spo2; requestSpo2()
+            if !stressDayRejected && daysAgo < Self.stressPastDays { daysAgo += 1; requestStress() }
+            else { daysAgo = 0; stage = .spo2; requestSpo2() }
         case .hrv:
             if daysAgo < 6 { daysAgo += 1; requestHRV() }
             else { stage = .temperature; requestTemperature() }

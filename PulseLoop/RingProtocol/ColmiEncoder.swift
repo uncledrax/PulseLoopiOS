@@ -121,7 +121,12 @@ struct ColmiEncoder {
         ]
     }
 
-    func syncStress() -> [UInt8] { [ColmiCommandID.syncStress] }
+    /// Stress history for one day. Byte 1 is the day offset (0 = today), the same field the firmware's
+    /// stress sender reads and echoes back in packet 1. `daysAgo: 0` is byte-identical to the old
+    /// bare `[0x37]` request (frames are zero-padded).
+    func syncStress(daysAgo: Int = 0) -> [UInt8] {
+        [ColmiCommandID.syncStress, UInt8(clamping: daysAgo)]
+    }
 
     /// HRV history carries `daysAgo` as a little-endian u32.
     func syncHRV(daysAgo: Int) -> [UInt8] {
