@@ -173,4 +173,16 @@ final class ColmiHistoryHeaderTests: XCTestCase {
         XCTAssertEqual(minutes(events, from: today), [27])
     }
 
+    // MARK: Kogan Aura
+
+    func testKoganAuraResolvesToItsCardOnTheQRingDriver() {
+        let model = WearableModel.model(advertisedName: "Kogan Aura")
+        XCTAssertEqual(model?.id, "kogan-aura")
+        XCTAssertEqual(model?.family, .colmiR02)
+        XCTAssertEqual(model?.imageName, "colmi-r02")
+        let noAdv = AdvertisementInfo(serviceUUIDs: [], manufacturerData: nil)
+        XCTAssertTrue(ColmiCoordinator.matches(name: "Kogan Aura", advertisement: noAdv))
+        XCTAssertFalse(ColmiSmartHealthCoordinator.matches(name: "Kogan Aura", advertisement: noAdv))
+        XCTAssertNil(WearableModel.model(advertisedName: "Kogan Aura 2"))
+    }
 }

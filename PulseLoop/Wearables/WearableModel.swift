@@ -261,6 +261,17 @@ extension WearableModel {
         forcedFamilyScanMatches: [.jring, .crp]
     )
 
+    /// Kogan Aura — the Australian retailer Kogan's badge on a QRing-protocol R02-class ring. The unit
+    /// this was added for advertises exactly `Kogan Aura` (no serial suffix) and reports hardware
+    /// `RY02KA_V3.0`, firmware `RY02KA_3.00.31_250603` — the same Realtek "RY" line as the Ring 2 Pro,
+    /// with an LIS3DH accelerometer. Same UART/big-data protocol as the rest of this family, so it rides
+    /// the Colmi driver; no extra capabilities until something beyond the family baseline is verified
+    /// on it. Uses the R02 art: there is no Kogan imageset, and an unregistered name renders an empty
+    /// platter.
+    static let koganAura = colmiFamily(
+        "kogan-aura", "Kogan Aura", brand: "Kogan", pattern: "^Kogan Aura$", imageName: "colmi-r02"
+    )
+
     // Yawell-branded variants of the same hardware.
     static let yawellR05 = colmiFamily("yawell-r05", "Yawell R05", brand: "Yawell", pattern: "^R05_[0-9A-F]{4}$")
     static let yawellR10 = colmiFamily("yawell-r10", "Yawell R10", brand: "Yawell", pattern: "^R10_[0-9A-F]{4}$")
@@ -398,6 +409,7 @@ extension WearableModel {
         colmiR02, colmiR03, colmiR06, colmiR07, colmiR08, colmiR09, colmiR10, colmiR11, colmiR12, colmiRing2Pro,
         colmiR99,
         yawellR05, yawellR10, yawellR11, h59,
+        koganAura,
         // Ahead of the YCBT siblings: `model(advertisedName:)` takes the first pattern that matches, and
         // R10M is the narrowest of the three.
         r10m,
