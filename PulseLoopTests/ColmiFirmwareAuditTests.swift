@@ -91,7 +91,7 @@ final class ColmiFirmwareAuditTests: XCTestCase {
         let writer = NullWriter()
         let driver = ColmiDriver(writer: writer)
         let notifyV2 = CBUUID(string: ColmiUUIDs.notifyV2)
-        let night = sleepFrame(start: 1380, end: 60, segments: [(0x02, 40), (0x03, 30), (0x05, 5), (0x02, 5)])
+        let night = sleepFrame(start: 1380, end: 20, segments: [(0x02, 40), (0x03, 30), (0x05, 5), (0x02, 5)])   // 23:00→00:20
 
         driver.connectionDidStart()
         driver.firmwareRevisionDidUpdate("RY02KA_3.00.31_PATCH3")
