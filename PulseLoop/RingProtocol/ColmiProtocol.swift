@@ -84,6 +84,7 @@ enum ColmiCommandID {
     }
 
     // sleep stage types
+    static let sleepGap: UInt8 = 0x00
     static let sleepLight: UInt8 = 0x02
     static let sleepDeep: UInt8 = 0x03
     static let sleepREM: UInt8 = 0x04
@@ -129,5 +130,22 @@ enum ColmiBytes {
     /// 24-bit LE (GadgetBridge passes a 0 high byte to toUint32).
     static func u24(_ a: UInt8, _ b: UInt8, _ c: UInt8) -> Int {
         Int(a) | (Int(b) << 8) | (Int(c) << 16)
+    }
+    /// 24-bit big-endian: `a` is the high byte.
+    static func u24be(_ a: UInt8, _ b: UInt8, _ c: UInt8) -> Int {
+        (Int(a) << 16) | (Int(b) << 8) | Int(c)
+    }
+}
+
+/// Facts about specific Colmi firmware builds, keyed on the Device Information firmware revision.
+enum ColmiFirmware {
+    /// Patched RY02KA firmware (`RY02KA_<version>_PATCH<n>`, n ≥ 3) sends sleep code 2 for every
+    /// sleeping minute instead of the stock firmware's light / deep / REM split, which `rand()` chooses
+    /// (the ring only measures sleep onset, waking, and awake spells of 2+ minutes).
+    static func reportsUnmeasuredSleepStages(firmwareRevision: String) -> Bool {
+        let revision = firmwareRevision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard revision.hasPrefix("RY02KA_"), let range = revision.range(of: "_PATCH", options: .backwards),
+              let patch = Int(revision[range.upperBound...]) else { return false }
+        return patch >= 3
     }
 }

@@ -147,14 +147,16 @@ struct SleepView: View {
             score: score.score,
             scoreLabel: score.label.rawValue
         )
-        VisualizationCard(eyebrow: "Stages", title: "Sleep architecture", legend: true) {
+        VisualizationCard(eyebrow: "Stages", title: s.stagesUnmeasured ? "Asleep and awake" : "Sleep architecture",
+                          legend: true, unstaged: s.stagesUnmeasured) {
             SleepHypnogramView(blocks: s.blocks, totalMin: s.session.totalMinutes, startTs: s.session.startAt,
                                onScrubActiveChanged: { hypnogramScrubbing = $0 })
         }
         SleepStageSummaryCardsView(
             deep: SleepFormat.duration(s.deepMinutes),
             light: SleepFormat.duration(s.lightMinutes),
-            awake: SleepFormat.duration(s.awakeMinutes)
+            awake: SleepFormat.duration(s.awakeMinutes),
+            asleep: s.stagesUnmeasured ? SleepFormat.duration(s.unstagedMinutes) : nil
         )
     }
 
@@ -455,6 +457,8 @@ private struct VisualizationCard<Content: View>: View {
     let eyebrow: String
     let title: String
     let legend: Bool
+    /// Legend for an asleep / awake-only night.
+    var unstaged: Bool = false
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -467,9 +471,13 @@ private struct VisualizationCard<Content: View>: View {
                 Spacer()
                 if legend {
                     HStack(spacing: 8) {
-                        legendItem("Deep", SleepStageColors.deep)
-                        legendItem("Light", SleepStageColors.light)
-                        legendItem("REM", SleepStageColors.rem)
+                        if unstaged {
+                            legendItem("Asleep", SleepStageColors.color(for: .unknown))
+                        } else {
+                            legendItem("Deep", SleepStageColors.deep)
+                            legendItem("Light", SleepStageColors.light)
+                            legendItem("REM", SleepStageColors.rem)
+                        }
                         legendItem("Awake", SleepStageColors.awake)
                     }
                     .fixedSize()

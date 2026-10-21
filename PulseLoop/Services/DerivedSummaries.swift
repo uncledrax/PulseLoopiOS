@@ -136,6 +136,17 @@ struct SleepSummary {
     let deepMinutes: Int
     let awakeMinutes: Int
     let blocks: [SleepStageBlock]
+    /// Asleep with no stage measured (`.unknown` blocks) — e.g. patched RY02KA firmware, which reports
+    /// sleep vs awake only rather than the stock firmware's randomly chosen light / deep / REM.
+    var unstagedMinutes: Int = 0
+
+    /// Most of this night's sleep carries no stage, so stage percentages (and anything scored or said
+    /// from them) don't describe it.
+    var stagesUnmeasured: Bool {
+        let staged = lightMinutes + deepMinutes
+            + blocks.filter { $0.stage == .rem }.reduce(0) { $0 + $1.durationMinutes }
+        return unstagedMinutes > 0 && unstagedMinutes >= staged
+    }
 }
 
 struct SleepRangeSummary {

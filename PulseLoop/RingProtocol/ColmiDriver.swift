@@ -11,7 +11,9 @@ final class ColmiDriver: WearableDriver {
     nonisolated deinit {}   // skip the main-actor isolated-deinit hop (crashes on older sim runtimes)
 
     private weak var writer: RingCommandWriter?
-    private let decoder = ColmiDecoder()
+    /// Decodes the normal channel's non-history frames and every reassembled big-data frame. A `var`
+    /// so the firmware revision can switch its sleep-stage mapping (`firmwareRevisionDidUpdate`).
+    private var decoder = ColmiDecoder()
     private let engine: ColmiSyncEngine
 
     // Big-data reassembly state (V2 channel), keyed by the 0xbc *type* byte so interleaved/fragmented
@@ -46,6 +48,21 @@ final class ColmiDriver: WearableDriver {
     /// write char — replies come back on the V2 notify char. Everything else uses the write char.
     func usesCommandChannel(for frame: Data) -> Bool {
         frame.first == ColmiCommandID.bigDataV2
+    }
+
+    // MARK: Firmware
+
+    /// The driver outlives reconnects, so the flag is cleared when a link comes up (the ring may have
+    /// been reflashed) and set again from that link's Device Information. Both 2A26 and 2A28 arrive
+    /// here, in either order; only a match sets it, so the other string can't clear it.
+    func connectionDidStart() {
+        decoder.sleepStagesUnmeasured = false
+    }
+
+    func firmwareRevisionDidUpdate(_ revision: String) {
+        if ColmiFirmware.reportsUnmeasuredSleepStages(firmwareRevision: revision) {
+            decoder.sleepStagesUnmeasured = true
+        }
     }
 
     // MARK: Inbound decode (+ reassembly + history routing)

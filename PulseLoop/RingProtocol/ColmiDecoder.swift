@@ -1,6 +1,8 @@
 import Foundation
 import os.log
 
+private let colmiSleepLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", category: "ColmiSleep")
+
 #if DEBUG
 private let realtimeHRLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", category: "ColmiRealtimeHR")
 #endif
@@ -10,10 +12,16 @@ private let realtimeHRLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", c
 ///    (HR / activity / stress / HRV).
 ///  - **Big-data (V2)**: reassembled `0xbc` frames for sleep / SpO2 / temperature.
 ///
-/// The decoder is stateless: paging/day bookkeeping that drives the history state machine lives in
-/// `ColmiSyncEngine`, which inspects the same raw frames. Layouts per `docs/ColmiR02-Protocol.md`;
+/// The decoder holds no paging state: the day bookkeeping that drives the history state machine lives
+/// in `ColmiSyncEngine`, which inspects the same raw frames. Its one setting, `sleepStagesUnmeasured`,
+/// comes from the ring's firmware revision. Layouts per `docs/ColmiR02-Protocol.md`;
 /// `// UNVERIFIED` marks anything not checkable without a physical ring.
 struct ColmiDecoder {
+
+    /// Patched RY02KA firmware (PATCH3 and later, see `ColmiFirmware`) no longer invents a light / deep
+    /// / REM split: every sleeping minute carries code 2, which then means "asleep, stage not measured"
+    /// and decodes to `.unknown` (HealthKit: asleep, unspecified) instead of `.light`.
+    var sleepStagesUnmeasured = false
 
     /// Decode a normal-channel (V1) frame.
     func decodeNormal(_ data: Data, now: Date = Date(), calendar: Calendar = .current) -> [RingDecodedEvent] {
@@ -173,9 +181,13 @@ extension ColmiDecoder {
             return [.battery(percent: Int(v[2]))]
         case ColmiCommandID.notifLiveActivity:
             // Cumulative daily totals; PulseLoop treats steps/distance/calories as an activity update.
-            let steps = ColmiBytes.u24(v[2], v[3], v[4])
-            let calories = Double(ColmiBytes.u24(v[5], v[6], v[7])) / 10.0
-            let distance = Double(ColmiBytes.u24(v[8], v[9], v[10]))
+            // Per the RY02KA firmware's sender (0x829346): three **big-endian** u24s — steps, calories in
+            // small calories (its day accumulator, 27–47 cal per step for a 70 kg wearer), and metres
+            // (centimetres ÷ 100). Read little-endian with calories ÷10, a 3,411-step day decoded as
+            // 5.4 million steps, so the bridge's daily ceilings dropped every live update.
+            let steps = ColmiBytes.u24be(v[2], v[3], v[4])
+            let calories = Double(ColmiBytes.u24be(v[5], v[6], v[7])) / 1000.0
+            let distance = Double(ColmiBytes.u24be(v[8], v[9], v[10]))
             return [.activityUpdate(timestamp: now, steps: steps, distanceMeters: distance, calories: calories)]
         default:
             return [.commandAck(commandId: v[0])]
@@ -257,8 +269,10 @@ extension ColmiDecoder {
 
     /// Activity history packet → one intraday **bucket** (quarter-hour). Verified against real R11
     /// captures: each `0x43` carries one 15-min bucket, so we emit `.activityBucket` (summed per day)
-    /// rather than a cumulative `.activityUpdate`. Calories are intentionally omitted — the ring's
-    /// calorie field is unverified/implausible (e.g. 10,915 for a single bucket).
+    /// rather than a cumulative `.activityUpdate`. Calories are omitted. The field (bytes 7–8) is in
+    /// units of 10 cal when the request's byte 5 is 1, as ours is, so the 10,915 once seen in a bucket
+    /// is 109 kcal — plausible for an hour of walking, not a decoding fault. (RY02KA firmware writes
+    /// one bucket per hour, at quarter index hour×4.)
     ///
     /// Layout: `43 yy MM dd qh cur tot ca ca st st di di …` where yy/MM/dd are BCD-literal date bytes,
     /// `qh = v[4]/4` is the nth-quarter-of-day hour, `cur/tot` are packet indices, and
@@ -390,13 +404,20 @@ extension ColmiDecoder {
                 index += 2
                 j += 2
                 guard minutes > 0 else { continue }
-                let stage = Self.sleepStage(stageType)
+                let stage = Self.sleepStage(stageType, stagesUnmeasured: sleepStagesUnmeasured)
                 // Expand to one entry per minute so the existing hypnogram (which maps a [SleepStage]
                 // timeline) renders proportional blocks.
                 stages.append(contentsOf: Array(repeating: stage, count: minutes))
             }
-            if !stages.isEmpty {
+            guard !stages.isEmpty else { continue }
+            if Self.segmentsMatchSpan(minutes: stages.count, start: sleepStart, end: sleepEnd) {
                 events.append(.sleepTimeline(timestamp: sessionStart, stages: stages))
+            } else {
+                // The segments of a night always add up to its start→end span on firmware we've seen
+                // (captured Ring 2 Pro night; RY02KA in emulation). A mismatch means the record is
+                // corrupt — RY02KA overruns its 40-segment arrays on restless nights and then sends
+                // leftover memory as stages — so the night is dropped rather than charted.
+                colmiSleepLog.info("dropped corrupt sleep day -\(daysAgo): \(stages.count) min of segments vs \(sleepStart)→\(sleepEnd)")
             }
         }
         return events
@@ -419,13 +440,29 @@ extension ColmiDecoder {
         }
     }
 
-    static func sleepStage(_ type: UInt8) -> SleepStage {
+    /// `stagesUnmeasured`: the firmware sends code 2 for every sleeping minute (see
+    /// `sleepStagesUnmeasured`), so light / deep / REM all mean "asleep, stage not measured".
+    static func sleepStage(_ type: UInt8, stagesUnmeasured: Bool = false) -> SleepStage {
+        let stagedCodes = [ColmiCommandID.sleepLight, ColmiCommandID.sleepDeep, ColmiCommandID.sleepREM]
+        if stagesUnmeasured && stagedCodes.contains(type) { return .unknown }
         switch type {
+        // Code 0 fills the time between two sleep periods the ring joined into one night: an
+        // awakening of 10+ minutes (plus the ring's 16-minute re-detection hold-off), or the ring off.
+        // It is never sleep, so it is charted as awake rather than dropped as unknown — which also kept
+        // it out of the awake total and exported it to HealthKit as *asleep*, unspecified.
+        case ColmiCommandID.sleepGap: return .awake
         case ColmiCommandID.sleepLight: return .light
         case ColmiCommandID.sleepDeep: return .deep
         case ColmiCommandID.sleepREM: return .rem
         case ColmiCommandID.sleepAwake: return .awake
         default: return .unknown
         }
+    }
+
+    /// Whether a night's segment minutes cover its start→end span (minutes of the day; the span wraps
+    /// midnight when start > end). Allows a few minutes of slack for firmware that rounds the ends.
+    static func segmentsMatchSpan(minutes: Int, start: Int, end: Int) -> Bool {
+        let span = ((end - start) % 1440 + 1440) % 1440
+        return abs(minutes - span) <= max(5, span / 50)
     }
 }

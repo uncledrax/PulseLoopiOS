@@ -1027,6 +1027,7 @@ extension RingBLEClient: CBPeripheralDelegate {
             if firmwareCharUUIDs.contains(characteristic.uuid) {
                 if let fw = String(data: value, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !fw.isEmpty {
+                    activeDriver?.firmwareRevisionDidUpdate(fw)
                     publish(.firmwareVersion(fw))
                 }
                 return

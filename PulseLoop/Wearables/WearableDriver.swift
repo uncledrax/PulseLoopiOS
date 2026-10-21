@@ -73,6 +73,10 @@ protocol WearableDriver: AnyObject {
     /// must be stopped here. Default: no-op.
     func connectionDidEnd()
 
+    /// The ring's Device Information firmware revision was read (each connect). For drivers whose
+    /// decoding depends on the firmware build. Default: no-op.
+    func firmwareRevisionDidUpdate(_ revision: String)
+
     /// Notify characteristics that must **all** be subscribed before the connection counts as up.
     ///
     /// A driver that leaves this empty gets the historical behaviour: `.connected` fires — and with it
@@ -113,6 +117,7 @@ extension WearableDriver {
     func usesCommandChannel(for frame: Data) -> Bool { false }
     func connectionDidStart() {}
     func connectionDidEnd() {}
+    func firmwareRevisionDidUpdate(_ revision: String) {}
     /// Empty keeps the historical behaviour: the connection is up as soon as *any* notify characteristic
     /// starts notifying.
     var requiredSubscriptionsBeforeConnected: [CBUUID] { [] }
