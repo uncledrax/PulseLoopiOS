@@ -90,16 +90,23 @@ struct ColmiDecoder {
 
     /// Day-aware history decode, called by `ColmiSyncEngine` which tracks the current sync-day.
     /// HR/stress/HRV use the passed `day`; activity carries its own date in the frame.
-    func decodeHistory(_ data: Data, day: Date, calendar: Calendar = .current, now: Date = Date()) -> [RingDecodedEvent] {
+    ///
+    /// `intervalMinutes` is the slot spacing the ring announced in that day's header packet (see
+    /// `ColmiPagedHistoryHeader`). `nil` keeps the long-standing defaults — 5 min for HR, 30 min for
+    /// stress/HRV — which is exactly what stock QRing firmware announces, so behaviour only changes when
+    /// a ring says its log is spaced differently.
+    func decodeHistory(
+        _ data: Data, day: Date, calendar: Calendar = .current, now: Date = Date(), intervalMinutes: Int? = nil
+    ) -> [RingDecodedEvent] {
         guard let packet = ColmiPacket(validating: data) else { return [] }
         let v = packet.bytes
         switch v[0] {
         case ColmiCommandID.syncHeartRate:
-            return decodeHRHistory(v, day: day, calendar: calendar)
+            return decodeHRHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 5)
         case ColmiCommandID.syncStress:
-            return decodeStressHistory(v, day: day, calendar: calendar)
+            return decodeStressHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 30)
         case ColmiCommandID.syncHRV:
-            return decodeHRVHistory(v, day: day, calendar: calendar)
+            return decodeHRVHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 30)
         case ColmiCommandID.syncActivity:
             return decodeActivityHistory(v, calendar: calendar, now: now)
         default:
@@ -112,6 +119,53 @@ struct ColmiDecoder {
         guard data.count >= 2 else { return nil }
         return Int([UInt8](data)[1])
     }
+}
+
+/// The header packet (page 0) that opens one day of paged HR / stress / HRV history:
+/// `[cmd, 0x00, totalPackets, intervalMinutes]`.
+///
+/// Read from the history senders of the QRing firmware itself (RY02 / RY02KA builds): heart rate
+/// replies `15 00 18 05` — 24 packets including this one, a 5-minute log — and stress / HRV reply
+/// `37 00 05 1e` / `39 00 05 1e` — 5 packets, a 30-minute log. Data packets are numbered
+/// `1 … totalPackets - 1`, so the day is complete at `totalPackets - 1`; an empty day is a single
+/// `cmd ff` reply instead of a header.
+///
+/// Values outside sane bounds are ignored (`nil`), so a ring whose page 0 means something else falls back
+/// to the decoder's fixed spacing and the engine's older end-of-day heuristics.
+struct ColmiPagedHistoryHeader: Equatable {
+    let opcode: UInt8
+    let totalPackets: Int
+    let intervalMinutes: Int
+
+    static let pagedOpcodes: Set<UInt8> = [
+        ColmiCommandID.syncHeartRate, ColmiCommandID.syncStress, ColmiCommandID.syncHRV,
+    ]
+
+    init(opcode: UInt8, totalPackets: Int, intervalMinutes: Int) {
+        self.opcode = opcode
+        self.totalPackets = totalPackets
+        self.intervalMinutes = intervalMinutes
+    }
+
+    /// Parse a checksum-valid page-0 frame of a paged history opcode; `nil` for anything else.
+    init?(_ data: Data) {
+        guard let packet = ColmiPacket(validating: data) else { return nil }
+        let v = packet.bytes
+        guard v.count >= 4, Self.pagedOpcodes.contains(v[0]), v[1] == 0 else { return nil }
+        let total = Int(v[2]), interval = Int(v[3])
+        // 1 ≤ total ≤ 64 covers every layout up to a 1-minute HR log (1 + ⌈1444 / 13⌉ = 113 would not
+        // fit a day record anyway); intervals beyond an hour are not a per-day slot log.
+        guard (1...64).contains(total), (1...60).contains(interval) else { return nil }
+        self.init(opcode: v[0], totalPackets: total, intervalMinutes: interval)
+    }
+
+    /// The day is complete once the packet numbered `totalPackets - 1` has arrived.
+    func isFinalPacket(_ packetNumber: Int) -> Bool {
+        packetNumber >= totalPackets - 1
+    }
+}
+
+extension ColmiDecoder {
 
     private func decodeNotification(_ v: [UInt8], now: Date) -> [RingDecodedEvent] {
         switch v[1] {
@@ -130,23 +184,24 @@ struct ColmiDecoder {
 
     // MARK: Paged history (normal channel)
 
-    /// HR history packet → up to N heart-rate samples (5-minute spaced). The engine handles paging
-    /// (which day, packet ordering); here we just emit samples for the given day-of-`now`.
-    private func decodeHRHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// HR history packet → up to N heart-rate samples, one per `interval`-minute slot (5 on stock
+    /// firmware). The engine handles paging (which day, packet ordering); here we just emit samples for
+    /// the given day. Packet 1 carries a 4-byte timestamp then 9 slots; every later packet 13 slots.
+    private func decodeHRHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
-        // 0xff = empty, 0 = header (total count); neither carries samples.
+        // 0xff = empty, 0 = header (total count + interval); neither carries samples.
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 6 : 2   // packet 1 has a 4-byte timestamp in 2..5
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 9 * 5 + (packetNr - 2) * 13 * 5
+            minutesInPrevious = 9 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let bpm = Int(v[i])
             guard bpm != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 5
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.historyMeasurement(kind: .heartRate, value: Double(bpm), timestamp: ts))
             }
@@ -154,21 +209,22 @@ struct ColmiDecoder {
         return events
     }
 
-    /// Stress history packet → stress samples (30-minute spaced).
-    private func decodeStressHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// Stress history packet → stress samples, one per `interval`-minute slot (30 on stock firmware).
+    /// Packet 1 carries the echoed day offset then 12 slots; every later packet 13 slots.
+    private func decodeStressHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 3 : 2
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 12 * 30 + (packetNr - 2) * 13 * 30
+            minutesInPrevious = 12 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let stress = Int(v[i])
             guard stress != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 30
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.stressSample(value: stress, timestamp: ts))
             }
@@ -176,21 +232,22 @@ struct ColmiDecoder {
         return events
     }
 
-    /// HRV history packet → HRV samples in ms (30-minute spaced).
-    private func decodeHRVHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// HRV history packet → HRV samples in ms, one per `interval`-minute slot (30 on stock firmware).
+    /// Same packing as stress: packet 1 = echoed day offset + 12 slots, later packets 13 slots.
+    private func decodeHRVHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 3 : 2
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 12 * 30 + (packetNr - 2) * 13 * 30
+            minutesInPrevious = 12 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let hrv = Int(v[i])
             guard hrv != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 30
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.hrvSample(value: hrv, timestamp: ts))
             }

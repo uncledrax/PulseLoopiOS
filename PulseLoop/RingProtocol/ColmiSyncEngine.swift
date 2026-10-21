@@ -52,6 +52,9 @@ final class ColmiSyncEngine: RingSyncEngine {
 
     private var stage: Stage = .idle
     private var daysAgo = 0
+    /// Page 0 of the paged HR / stress / HRV day currently in flight: how many packets the day spans and
+    /// the slot interval. Cleared on every paged request so one day's header never leaks into the next.
+    private var pagedHeader: ColmiPagedHistoryHeader?
     /// The midnight of the day currently being synced (for HR/stress/HRV sample timestamps).
     private var syncDay = Calendar.current.startOfDay(for: Date())
     /// A targeted post-workout run: today's HR log → SpO2 big-data → done, skipping the other five
@@ -224,17 +227,20 @@ final class ColmiSyncEngine: RingSyncEngine {
 
     private func requestHeartRate() {
         syncDay = dayStart(daysAgo)
+        pagedHeader = nil
         let unix = Int(syncDay.timeIntervalSince1970)
         writer?.enqueue(Data(encoder.syncHeartRate(fromUnix: unix)))
     }
 
     private func requestStress() {
         syncDay = calendar.startOfDay(for: Date())
+        pagedHeader = nil
         writer?.enqueue(Data(encoder.syncStress()))
     }
 
     private func requestHRV() {
         syncDay = dayStart(daysAgo)
+        pagedHeader = nil
         writer?.enqueue(Data(encoder.syncHRV(daysAgo: daysAgo)))
     }
 
@@ -251,7 +257,9 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// Decode a paged history frame for the current sync-day and advance the machine. Returns the
     /// decoded sample events for the bus.
     func handleHistoryFrame(_ data: Data) -> [RingDecodedEvent] {
-        let events = decoder.decodeHistory(data, day: syncDay, calendar: calendar)
+        if let header = ColmiPagedHistoryHeader(data) { pagedHeader = header }
+        let interval = (pagedHeader?.opcode == data.first) ? pagedHeader?.intervalMinutes : nil
+        let events = decoder.decodeHistory(data, day: syncDay, calendar: calendar, intervalMinutes: interval)
         advanceAfterPagedFrame(data)
         armWatchdog()   // progress made — reset the stall timer
         return events
@@ -289,8 +297,8 @@ final class ColmiSyncEngine: RingSyncEngine {
     private func advanceAfterPagedFrame(_ data: Data) {
         let packetNr = ColmiDecoder.historyPacketNumber(data)
         let isEmpty = packetNr == 0xff
-        // For paged HR/stress/HRV, byte[2] in packet 0 carries the total; we conservatively treat any
-        // empty/terminal as "advance". A header packet (0) just waits for data packets.
+        // For paged HR/stress/HRV the day's header (packet 0) announces the packet count, so the day ends
+        // on packet `total - 1` (a header announcing a single packet completes the day by itself).
         let dayComplete = isEmpty || isTerminalPacket(data)
 
         guard dayComplete else { return }
@@ -313,19 +321,24 @@ final class ColmiSyncEngine: RingSyncEngine {
         }
     }
 
-    /// Terminal packet heuristic for paged stages: stress/HRV finish at packet 4 (GadgetBridge);
-    /// activity finishes when `currentPacket == totalPackets - 1` (bytes 5/6).
+    /// Terminal packet for paged stages. HR/stress/HRV: the packet numbered `totalPackets - 1` from the
+    /// day's header. Without a usable header, the older heuristics stand: stress/HRV finish at packet 4
+    /// (GadgetBridge) and HR relies on the watchdog. Activity finishes when `currentPacket ==
+    /// totalPackets - 1` (bytes 5/6).
     private func isTerminalPacket(_ data: Data) -> Bool {
         let v = [UInt8](data)
         guard v.count >= 7 else { return false }
+        if let header = pagedHeader, header.opcode == v[0] {
+            return header.isFinalPacket(Int(v[1]))
+        }
         switch v[0] {
         case ColmiCommandID.syncStress, ColmiCommandID.syncHRV:
             return Int(v[1]) == 4
         case ColmiCommandID.syncActivity:
             return Int(v[5]) == Int(v[6]) - 1
         case ColmiCommandID.syncHeartRate:
-            // packet 0 carries total in byte[2]; treat last packet as terminal.
-            return false   // UNVERIFIED: rely on emptiness / next-day request cadence
+            // No header seen for this day: fall back to emptiness / the stage watchdog.
+            return false
         default:
             return false
         }
