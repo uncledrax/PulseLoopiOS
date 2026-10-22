@@ -269,6 +269,7 @@ struct SleepStageDistribution {
             (Double(max(0, sleep.deepMinutes)), SleepStageColors.deep, "DEEP"),
             (Double(max(0, sleep.lightMinutes)), SleepStageColors.light, "LIGHT"),
             (Double(max(0, remMinutes)), SleepStageColors.rem, "REM"),
+            (Double(max(0, sleep.unstagedMinutes)), SleepStageColors.color(for: .unknown), "SLEEP"),
             (Double(max(0, sleep.awakeMinutes)), SleepStageColors.awake, "AWK"),
         ]
         segments = raw.filter { $0.0 > 0 }.map { SleepStageSegment(minutes: $0.0, color: $0.1, label: $0.2) }

@@ -163,13 +163,13 @@ final class ColmiDecoderTests: XCTestCase {
     }
 
     func testLiveActivityNotification() {
-        // 73 12 then steps(u24 @2..4)=500, calories(u24 @5..7)=1234 (=123.4), distance(u24 @8..10)=300
-        // steps 500 = 0xF4 0x01 0x00 ; cal 1234 = 0xD2 0x04 0x00 ; dist 300 = 0x2C 0x01 0x00
+        // 73 12 then big-endian u24s: steps=500, calories=1234 cal (=1.234 kcal), distance=300 m
+        // steps 500 = 0x00 0x01 0xF4 ; cal 1234 = 0x00 0x04 0xD2 ; dist 300 = 0x00 0x01 0x2C
         let frame = ColmiPacket.frame([
             ColmiCommandID.notification, ColmiCommandID.notifLiveActivity,
-            0xF4, 0x01, 0x00,
-            0xD2, 0x04, 0x00,
-            0x2C, 0x01, 0x00,
+            0x00, 0x01, 0xF4,
+            0x00, 0x04, 0xD2,
+            0x00, 0x01, 0x2C,
         ])
         let events = decoder.decodeNormal(frame)
         guard case let .activityUpdate(_, steps, distance, calories) = events.first else {
@@ -177,7 +177,7 @@ final class ColmiDecoderTests: XCTestCase {
         }
         XCTAssertEqual(steps, 500)
         XCTAssertEqual(distance, 300)
-        XCTAssertEqual(calories, 123.4, accuracy: 0.01)
+        XCTAssertEqual(calories, 1.234, accuracy: 0.0001)
     }
 
     // MARK: Big-data (V2)

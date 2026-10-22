@@ -1,6 +1,8 @@
 import Foundation
 import os.log
 
+private let colmiSleepLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", category: "ColmiSleep")
+
 #if DEBUG
 private let realtimeHRLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", category: "ColmiRealtimeHR")
 #endif
@@ -10,10 +12,16 @@ private let realtimeHRLog = Logger(subsystem: "xyz.sakshambhutani.pulseloop2", c
 ///    (HR / activity / stress / HRV).
 ///  - **Big-data (V2)**: reassembled `0xbc` frames for sleep / SpO2 / temperature.
 ///
-/// The decoder is stateless: paging/day bookkeeping that drives the history state machine lives in
-/// `ColmiSyncEngine`, which inspects the same raw frames. Layouts per `docs/ColmiR02-Protocol.md`;
+/// The decoder holds no paging state: the day bookkeeping that drives the history state machine lives
+/// in `ColmiSyncEngine`, which inspects the same raw frames. Its one setting, `sleepStagesUnmeasured`,
+/// comes from the ring's firmware revision. Layouts per `docs/ColmiR02-Protocol.md`;
 /// `// UNVERIFIED` marks anything not checkable without a physical ring.
 struct ColmiDecoder {
+
+    /// Patched RY02KA firmware (PATCH3 and later, see `ColmiFirmware`) no longer invents a light / deep
+    /// / REM split: every sleeping minute carries code 2, which then means "asleep, stage not measured"
+    /// and decodes to `.unknown` (HealthKit: asleep, unspecified) instead of `.light`.
+    var sleepStagesUnmeasured = false
 
     /// Decode a normal-channel (V1) frame.
     func decodeNormal(_ data: Data, now: Date = Date(), calendar: Calendar = .current) -> [RingDecodedEvent] {
@@ -90,16 +98,23 @@ struct ColmiDecoder {
 
     /// Day-aware history decode, called by `ColmiSyncEngine` which tracks the current sync-day.
     /// HR/stress/HRV use the passed `day`; activity carries its own date in the frame.
-    func decodeHistory(_ data: Data, day: Date, calendar: Calendar = .current, now: Date = Date()) -> [RingDecodedEvent] {
+    ///
+    /// `intervalMinutes` is the slot spacing the ring announced in that day's header packet (see
+    /// `ColmiPagedHistoryHeader`). `nil` keeps the long-standing defaults — 5 min for HR, 30 min for
+    /// stress/HRV — which is exactly what stock QRing firmware announces, so behaviour only changes when
+    /// a ring says its log is spaced differently.
+    func decodeHistory(
+        _ data: Data, day: Date, calendar: Calendar = .current, now: Date = Date(), intervalMinutes: Int? = nil
+    ) -> [RingDecodedEvent] {
         guard let packet = ColmiPacket(validating: data) else { return [] }
         let v = packet.bytes
         switch v[0] {
         case ColmiCommandID.syncHeartRate:
-            return decodeHRHistory(v, day: day, calendar: calendar)
+            return decodeHRHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 5)
         case ColmiCommandID.syncStress:
-            return decodeStressHistory(v, day: day, calendar: calendar)
+            return decodeStressHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 30)
         case ColmiCommandID.syncHRV:
-            return decodeHRVHistory(v, day: day, calendar: calendar)
+            return decodeHRVHistory(v, day: day, calendar: calendar, interval: intervalMinutes ?? 30)
         case ColmiCommandID.syncActivity:
             return decodeActivityHistory(v, calendar: calendar, now: now)
         default:
@@ -112,6 +127,53 @@ struct ColmiDecoder {
         guard data.count >= 2 else { return nil }
         return Int([UInt8](data)[1])
     }
+}
+
+/// The header packet (page 0) that opens one day of paged HR / stress / HRV history:
+/// `[cmd, 0x00, totalPackets, intervalMinutes]`.
+///
+/// Read from the history senders of the QRing firmware itself (RY02 / RY02KA builds): heart rate
+/// replies `15 00 18 05` — 24 packets including this one, a 5-minute log — and stress / HRV reply
+/// `37 00 05 1e` / `39 00 05 1e` — 5 packets, a 30-minute log. Data packets are numbered
+/// `1 … totalPackets - 1`, so the day is complete at `totalPackets - 1`; an empty day is a single
+/// `cmd ff` reply instead of a header.
+///
+/// Values outside sane bounds are ignored (`nil`), so a ring whose page 0 means something else falls back
+/// to the decoder's fixed spacing and the engine's older end-of-day heuristics.
+struct ColmiPagedHistoryHeader: Equatable {
+    let opcode: UInt8
+    let totalPackets: Int
+    let intervalMinutes: Int
+
+    static let pagedOpcodes: Set<UInt8> = [
+        ColmiCommandID.syncHeartRate, ColmiCommandID.syncStress, ColmiCommandID.syncHRV,
+    ]
+
+    init(opcode: UInt8, totalPackets: Int, intervalMinutes: Int) {
+        self.opcode = opcode
+        self.totalPackets = totalPackets
+        self.intervalMinutes = intervalMinutes
+    }
+
+    /// Parse a checksum-valid page-0 frame of a paged history opcode; `nil` for anything else.
+    init?(_ data: Data) {
+        guard let packet = ColmiPacket(validating: data) else { return nil }
+        let v = packet.bytes
+        guard v.count >= 4, Self.pagedOpcodes.contains(v[0]), v[1] == 0 else { return nil }
+        let total = Int(v[2]), interval = Int(v[3])
+        // 1 ≤ total ≤ 64 covers every layout up to a 1-minute HR log (1 + ⌈1444 / 13⌉ = 113 would not
+        // fit a day record anyway); intervals beyond an hour are not a per-day slot log.
+        guard (1...64).contains(total), (1...60).contains(interval) else { return nil }
+        self.init(opcode: v[0], totalPackets: total, intervalMinutes: interval)
+    }
+
+    /// The day is complete once the packet numbered `totalPackets - 1` has arrived.
+    func isFinalPacket(_ packetNumber: Int) -> Bool {
+        packetNumber >= totalPackets - 1
+    }
+}
+
+extension ColmiDecoder {
 
     private func decodeNotification(_ v: [UInt8], now: Date) -> [RingDecodedEvent] {
         switch v[1] {
@@ -119,9 +181,13 @@ struct ColmiDecoder {
             return [.battery(percent: Int(v[2]))]
         case ColmiCommandID.notifLiveActivity:
             // Cumulative daily totals; PulseLoop treats steps/distance/calories as an activity update.
-            let steps = ColmiBytes.u24(v[2], v[3], v[4])
-            let calories = Double(ColmiBytes.u24(v[5], v[6], v[7])) / 10.0
-            let distance = Double(ColmiBytes.u24(v[8], v[9], v[10]))
+            // Per the RY02KA firmware's sender (0x829346): three **big-endian** u24s — steps, calories in
+            // small calories (its day accumulator, 27–47 cal per step for a 70 kg wearer), and metres
+            // (centimetres ÷ 100). Read little-endian with calories ÷10, a 3,411-step day decoded as
+            // 5.4 million steps, so the bridge's daily ceilings dropped every live update.
+            let steps = ColmiBytes.u24be(v[2], v[3], v[4])
+            let calories = Double(ColmiBytes.u24be(v[5], v[6], v[7])) / 1000.0
+            let distance = Double(ColmiBytes.u24be(v[8], v[9], v[10]))
             return [.activityUpdate(timestamp: now, steps: steps, distanceMeters: distance, calories: calories)]
         default:
             return [.commandAck(commandId: v[0])]
@@ -130,23 +196,24 @@ struct ColmiDecoder {
 
     // MARK: Paged history (normal channel)
 
-    /// HR history packet → up to N heart-rate samples (5-minute spaced). The engine handles paging
-    /// (which day, packet ordering); here we just emit samples for the given day-of-`now`.
-    private func decodeHRHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// HR history packet → up to N heart-rate samples, one per `interval`-minute slot (5 on stock
+    /// firmware). The engine handles paging (which day, packet ordering); here we just emit samples for
+    /// the given day. Packet 1 carries a 4-byte timestamp then 9 slots; every later packet 13 slots.
+    private func decodeHRHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
-        // 0xff = empty, 0 = header (total count); neither carries samples.
+        // 0xff = empty, 0 = header (total count + interval); neither carries samples.
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 6 : 2   // packet 1 has a 4-byte timestamp in 2..5
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 9 * 5 + (packetNr - 2) * 13 * 5
+            minutesInPrevious = 9 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let bpm = Int(v[i])
             guard bpm != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 5
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.historyMeasurement(kind: .heartRate, value: Double(bpm), timestamp: ts))
             }
@@ -154,21 +221,22 @@ struct ColmiDecoder {
         return events
     }
 
-    /// Stress history packet → stress samples (30-minute spaced).
-    private func decodeStressHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// Stress history packet → stress samples, one per `interval`-minute slot (30 on stock firmware).
+    /// Packet 1 carries the echoed day offset then 12 slots; every later packet 13 slots.
+    private func decodeStressHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 3 : 2
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 12 * 30 + (packetNr - 2) * 13 * 30
+            minutesInPrevious = 12 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let stress = Int(v[i])
             guard stress != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 30
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.stressSample(value: stress, timestamp: ts))
             }
@@ -176,21 +244,22 @@ struct ColmiDecoder {
         return events
     }
 
-    /// HRV history packet → HRV samples in ms (30-minute spaced).
-    private func decodeHRVHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar) -> [RingDecodedEvent] {
+    /// HRV history packet → HRV samples in ms, one per `interval`-minute slot (30 on stock firmware).
+    /// Same packing as stress: packet 1 = echoed day offset + 12 slots, later packets 13 slots.
+    private func decodeHRVHistory(_ v: [UInt8], day: Date? = nil, calendar: Calendar, interval: Int) -> [RingDecodedEvent] {
         let packetNr = Int(v[1])
         guard packetNr != 0xff, packetNr != 0 else { return [] }
         let startIndex = packetNr == 1 ? 3 : 2
         var minutesInPrevious = 0
         if packetNr > 1 {
-            minutesInPrevious = 12 * 30 + (packetNr - 2) * 13 * 30
+            minutesInPrevious = 12 * interval + (packetNr - 2) * 13 * interval
         }
         let base = day ?? calendar.startOfDay(for: Date())
         var events: [RingDecodedEvent] = []
         for i in startIndex..<(v.count - 1) {
             let hrv = Int(v[i])
             guard hrv != 0 else { continue }
-            let minuteOfDay = minutesInPrevious + (i - startIndex) * 30
+            let minuteOfDay = minutesInPrevious + (i - startIndex) * interval
             if let ts = calendar.date(byAdding: .minute, value: minuteOfDay, to: base) {
                 events.append(.hrvSample(value: hrv, timestamp: ts))
             }
@@ -200,8 +269,10 @@ struct ColmiDecoder {
 
     /// Activity history packet → one intraday **bucket** (quarter-hour). Verified against real R11
     /// captures: each `0x43` carries one 15-min bucket, so we emit `.activityBucket` (summed per day)
-    /// rather than a cumulative `.activityUpdate`. Calories are intentionally omitted — the ring's
-    /// calorie field is unverified/implausible (e.g. 10,915 for a single bucket).
+    /// rather than a cumulative `.activityUpdate`. Calories are omitted. The field (bytes 7–8) is in
+    /// units of 10 cal when the request's byte 5 is 1, as ours is, so the 10,915 once seen in a bucket
+    /// is 109 kcal — plausible for an hour of walking, not a decoding fault. (RY02KA firmware writes
+    /// one bucket per hour, at quarter index hour×4.)
     ///
     /// Layout: `43 yy MM dd qh cur tot ca ca st st di di …` where yy/MM/dd are BCD-literal date bytes,
     /// `qh = v[4]/4` is the nth-quarter-of-day hour, `cur/tot` are packet indices, and
@@ -333,13 +404,20 @@ struct ColmiDecoder {
                 index += 2
                 j += 2
                 guard minutes > 0 else { continue }
-                let stage = Self.sleepStage(stageType)
+                let stage = Self.sleepStage(stageType, stagesUnmeasured: sleepStagesUnmeasured)
                 // Expand to one entry per minute so the existing hypnogram (which maps a [SleepStage]
                 // timeline) renders proportional blocks.
                 stages.append(contentsOf: Array(repeating: stage, count: minutes))
             }
-            if !stages.isEmpty {
+            guard !stages.isEmpty else { continue }
+            if Self.segmentsMatchSpan(minutes: stages.count, start: sleepStart, end: sleepEnd) {
                 events.append(.sleepTimeline(timestamp: sessionStart, stages: stages))
+            } else {
+                // The segments of a night always add up to its start→end span on firmware we've seen
+                // (captured Ring 2 Pro night; RY02KA in emulation). A mismatch means the record is
+                // corrupt — RY02KA overruns its 40-segment arrays on restless nights and then sends
+                // leftover memory as stages — so the night is dropped rather than charted.
+                colmiSleepLog.info("dropped corrupt sleep day -\(daysAgo): \(stages.count) min of segments vs \(sleepStart)→\(sleepEnd)")
             }
         }
         return events
@@ -362,13 +440,29 @@ struct ColmiDecoder {
         }
     }
 
-    static func sleepStage(_ type: UInt8) -> SleepStage {
+    /// `stagesUnmeasured`: the firmware sends code 2 for every sleeping minute (see
+    /// `sleepStagesUnmeasured`), so light / deep / REM all mean "asleep, stage not measured".
+    static func sleepStage(_ type: UInt8, stagesUnmeasured: Bool = false) -> SleepStage {
+        let stagedCodes = [ColmiCommandID.sleepLight, ColmiCommandID.sleepDeep, ColmiCommandID.sleepREM]
+        if stagesUnmeasured && stagedCodes.contains(type) { return .unknown }
         switch type {
+        // Code 0 fills the time between two sleep periods the ring joined into one night: an
+        // awakening of 10+ minutes (plus the ring's 16-minute re-detection hold-off), or the ring off.
+        // It is never sleep, so it is charted as awake rather than dropped as unknown — which also kept
+        // it out of the awake total and exported it to HealthKit as *asleep*, unspecified.
+        case ColmiCommandID.sleepGap: return .awake
         case ColmiCommandID.sleepLight: return .light
         case ColmiCommandID.sleepDeep: return .deep
         case ColmiCommandID.sleepREM: return .rem
         case ColmiCommandID.sleepAwake: return .awake
         default: return .unknown
         }
+    }
+
+    /// Whether a night's segment minutes cover its start→end span (minutes of the day; the span wraps
+    /// midnight when start > end). Allows a few minutes of slack for firmware that rounds the ends.
+    static func segmentsMatchSpan(minutes: Int, start: Int, end: Int) -> Bool {
+        let span = ((end - start) % 1440 + 1440) % 1440
+        return abs(minutes - span) <= max(5, span / 50)
     }
 }

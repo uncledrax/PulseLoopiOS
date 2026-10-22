@@ -318,6 +318,8 @@ final class RingSyncCoordinator {
     /// When `resyncHistoryIfStale` last kicked the engine — a light throttle so a burst of samples
     /// (each one an event-handler entry) can't re-enter while the kicked sync is still spinning up.
     private var lastResyncKickAt: Date?
+    /// When a run last ended `"incomplete"` (the ring answered nothing) — throttles the stale-sync kick.
+    private var lastIncompleteSyncAt: Date?
 
     init(client: RingBLEClient, context: ModelContext) {
         self.client = client
@@ -898,6 +900,10 @@ final class RingSyncCoordinator {
     /// `syncHistory()` is a no-op on jring/Colmi) keeps the label honest for the families whose history
     /// only comes down with the connect handshake.
     private func updateSync(stage: String) {
+        // `"incomplete"`: a run that ended without the ring answering anything (Colmi's stage watchdog
+        // walked it to the end). It ends the bar like "done", but no data was handed over, so it
+        // stamps nothing — neither "Synced Xm ago" here nor `lastFullSyncAt` in the event bus.
+        guard stage != "incomplete" else { lastIncompleteSyncAt = Date(); endSync(); return }
         if client.activeDeviceType != .rwfit { lastSyncAt = Date() }
         guard stage != "done" else { endSync(); return }
         syncStage = stage
@@ -1075,6 +1081,9 @@ private extension RingSyncCoordinator {
         guard isConnected, !isSyncing, !workoutHRActive else { return }
         // A kicked sync takes a moment before `isSyncing` reflects it; don't re-enter meanwhile.
         if let last = lastResyncKickAt, now.timeIntervalSince(last) < 60 { return }
+        // A ring that answered nothing last time isn't asked again on every wake: `"incomplete"` leaves
+        // `lastFullSyncAt` alone, so without this a silent ring would be re-synced about once a minute.
+        if let last = lastIncompleteSyncAt, now.timeIntervalSince(last) < periodicSyncInterval { return }
         let lastFullSync = DeviceRepository.current(context: context)?.lastFullSyncAt ?? .distantPast
         guard now.timeIntervalSince(lastFullSync) > periodicSyncInterval else { return }
         lastResyncKickAt = now

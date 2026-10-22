@@ -23,6 +23,18 @@ enum SleepStageColors {
     }
 }
 
+extension SleepStage {
+    /// Chart / readout name. `.unknown` is sleep with no stage measured — patched RY02KA firmware
+    /// reports asleep vs awake only — and HealthKit already files it as asleep, unspecified.
+    var chartName: String {
+        switch self {
+        case .rem: return "REM"
+        case .unknown: return "Asleep"
+        default: return rawValue.capitalized
+        }
+    }
+}
+
 // MARK: - HR line (Vitals)
 
 struct HRLineChart: View {
@@ -432,7 +444,14 @@ struct SleepHypnogramView: View {
     /// drag the carousel along with the finger.
     var onScrubActiveChanged: ((Bool) -> Void)? = nil
 
-    private let lanes: [SleepStage] = [.awake, .rem, .light, .deep]
+    /// A night with only unstaged sleep (and awake) gets two lanes, AWAKE and ASLEEP, instead of four
+    /// lanes of which three would be empty. Mixed nights keep the four stage lanes; any unstaged
+    /// blocks then draw muted in the light lane.
+    private var lanes: [SleepStage] {
+        let staged: Set<SleepStage> = [.light, .deep, .rem]
+        let unstagedOnly = blocks.contains { $0.stage == .unknown } && !blocks.contains { staged.contains($0.stage) }
+        return unstagedOnly ? [.awake, .unknown] : [.awake, .rem, .light, .deep]
+    }
 
     /// A press-and-hold scrub selection: which block the finger is over, and the minute under it.
     private struct Scrub: Equatable {
@@ -481,7 +500,7 @@ struct SleepHypnogramView: View {
     }
 
     private var sortedBlocks: [SleepStageBlock] {
-        blocks.filter { $0.durationMinutes > 0 && $0.stage != .unknown }.sorted { $0.startMinute < $1.startMinute }
+        blocks.filter { $0.durationMinutes > 0 }.sorted { $0.startMinute < $1.startMinute }
     }
 
     private var ticks: [(offset: Int, label: String)] {
@@ -547,7 +566,7 @@ struct SleepHypnogramView: View {
                     let gutterWidth = Self.plotInsets.leading - Self.labelLeading
 
                     ForEach(lanes, id: \.self) { stage in
-                        Text(stage.rawValue.uppercased())
+                        Text(stage.chartName.uppercased())
                             .font(PulseFont.micro.weight(.semibold))
                             .tracking(1.4)
                             .foregroundStyle(SleepStageColors.color(for: stage))
@@ -708,7 +727,7 @@ struct SleepHypnogramView: View {
     /// are offsets from sleep start ("DEEP · 0:58 – 1:44"), matching the relative tick labels.
     static func readoutText(stage: SleepStage, startMinute: Int, durationMinutes: Int, startTs: Date?,
                             locale: Locale = .current) -> String {
-        let name = stage.rawValue.uppercased()
+        let name = stage.chartName.uppercased()
         let endMinute = startMinute + durationMinutes
         guard let startTs else {
             func rel(_ m: Int) -> String { "\(m / 60):" + String(format: "%02d", m % 60) }
@@ -737,9 +756,9 @@ struct SleepHypnogramView: View {
         var totals: [SleepStage: Int] = [:]
         for entry in stages { totals[entry.stage, default: 0] += entry.minutes }
         func plural(_ n: Int, _ unit: String) -> String { "\(n) \(unit)\(n == 1 ? "" : "s")" }
-        let parts: [String] = [SleepStage.deep, .light, .rem, .awake].compactMap { stage in
+        let parts: [String] = [SleepStage.deep, .light, .rem, .unknown, .awake].compactMap { stage in
             guard let minutes = totals[stage], minutes > 0 else { return nil }
-            let name = stage == .rem ? "REM" : stage.rawValue.capitalized
+            let name = stage.chartName
             let h = minutes / 60, m = minutes % 60
             if h > 0 && m > 0 { return "\(name) \(plural(h, "hour")) \(plural(m, "minute"))" }
             if h > 0 { return "\(name) \(plural(h, "hour"))" }

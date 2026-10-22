@@ -84,6 +84,7 @@ enum ColmiCommandID {
     }
 
     // sleep stage types
+    static let sleepGap: UInt8 = 0x00
     static let sleepLight: UInt8 = 0x02
     static let sleepDeep: UInt8 = 0x03
     static let sleepREM: UInt8 = 0x04
@@ -129,5 +130,50 @@ enum ColmiBytes {
     /// 24-bit LE (GadgetBridge passes a 0 high byte to toUint32).
     static func u24(_ a: UInt8, _ b: UInt8, _ c: UInt8) -> Int {
         Int(a) | (Int(b) << 8) | (Int(c) << 16)
+    }
+    /// 24-bit big-endian: `a` is the high byte.
+    static func u24be(_ a: UInt8, _ b: UInt8, _ c: UInt8) -> Int {
+        (Int(a) << 16) | (Int(b) << 8) | Int(c)
+    }
+}
+
+/// Facts about specific Colmi firmware builds, keyed on the Device Information firmware revision.
+enum ColmiFirmware {
+    /// `n` of patched RY02KA firmware (`RY02KA_<version>_PATCH<n>`); nil for stock firmware or any other ring.
+    static func ry02kaPatchLevel(firmwareRevision: String) -> Int? {
+        let revision = firmwareRevision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard revision.hasPrefix("RY02KA_"), let range = revision.range(of: "_PATCH", options: .backwards) else { return nil }
+        return Int(revision[range.upperBound...])
+    }
+
+    /// Patched RY02KA firmware (`RY02KA_<version>_PATCH<n>`, n ≥ 3) sends sleep code 2 for every
+    /// sleeping minute instead of the stock firmware's light / deep / REM split, which `rand()` chooses
+    /// (the ring only measures sleep onset, waking, and awake spells of 2+ minutes).
+    static func reportsUnmeasuredSleepStages(firmwareRevision: String) -> Bool {
+        (ry02kaPatchLevel(firmwareRevision: firmwareRevision) ?? 0) >= 3
+    }
+
+    /// How often the ring really logs heart rate at an all-day interval setting, in seconds, when that
+    /// differs from the setting; nil when the ring logs at the interval it was sent.
+    ///
+    /// From PATCH2 on, RY02KA firmware counts the `0x16` interval in 36-second units instead of minutes,
+    /// so the app's 5…60 minutes run every 3…36 minutes (5 → 3, 10 → 6, 60 → 36). The setting sent to
+    /// the ring is unchanged; only what the app tells the user it means.
+    static func loggedHeartRateIntervalSeconds(settingMinutes: Int, firmwareRevision: String?) -> Int? {
+        guard let firmwareRevision, (ry02kaPatchLevel(firmwareRevision: firmwareRevision) ?? 0) >= 2 else { return nil }
+        return settingMinutes * 36
+    }
+
+    /// The stress / HRV logging interval, in minutes, of firmware that fixes it independently of any
+    /// setting: every 6 minutes from RY02KA PATCH2 on. nil for stock firmware (stress twice an hour,
+    /// HRV hourly) and other rings.
+    static func loggedStressAndHRVIntervalMinutes(firmwareRevision: String?) -> Int? {
+        guard let firmwareRevision, (ry02kaPatchLevel(firmwareRevision: firmwareRevision) ?? 0) >= 2 else { return nil }
+        return 6
+    }
+
+    /// "3 min" / "36 s" — an interval in the units the Measurement screen shows.
+    static func intervalLabel(seconds: Int) -> String {
+        seconds % 60 == 0 ? "\(seconds / 60) min" : "\(seconds) s"
     }
 }

@@ -70,9 +70,12 @@ enum SleepScore {
         let deep = Double(max(0, sleep.deepMinutes))
         let light = Double(max(0, sleep.lightMinutes))
         let awake = Double(max(0, sleep.awakeMinutes))
+        let stagesUnmeasured = sleep.stagesUnmeasured
         let coveredStageMin = sleep.blocks.reduce(0.0) { sum, block in
             switch block.stage {
             case .deep, .light, .awake: return sum + Double(max(0, block.durationMinutes))
+            // An asleep/awake-only night is fully covered by its unstaged + awake blocks.
+            case .unknown where stagesUnmeasured: return sum + Double(max(0, block.durationMinutes))
             default: return sum
             }
         }
@@ -90,6 +93,17 @@ enum SleepScore {
         let deepScore = bandScore(deepPct, idealLow: 13, idealHigh: 23, softLow: 5, softHigh: 35, hardLow: 0, hardHigh: 45, points: 30)
         let lightScore = bandScore(lightPct, idealLow: 50, idealHigh: 60, softLow: 35, softHigh: 75, hardLow: 20, hardHigh: 90, points: 20)
         let awakeSub = awakeScore(awakePct, points: 15)
+        if stagesUnmeasured {
+            // No stage mix to score: duration (35) and awake time (15) carry the whole score.
+            let score = Int(clamp(((duration + awakeSub) * 2).rounded(), 0, 100))
+            return SleepScoreResult(
+                score: score,
+                label: qualityLabel(score),
+                deepPct: 0,
+                lightPct: 0,
+                awakePct: awakePct.map { Int($0.rounded()) }
+            )
+        }
         let score = Int(clamp((duration + deepScore + lightScore + awakeSub).rounded(), 0, 100))
 
         return SleepScoreResult(
@@ -177,6 +191,7 @@ enum SleepInsights {
             let lightMinutes = daySessions.reduce(0) { $0 + $1.lightMinutes }
             let deepMinutes = daySessions.reduce(0) { $0 + $1.deepMinutes }
             let awakeMinutes = daySessions.reduce(0) { $0 + $1.awakeMinutes }
+            let unstagedMinutes = daySessions.reduce(0) { $0 + $1.unstagedMinutes }
             let blocks = daySessions.flatMap { $0.blocks }.sorted { $0.startAt < $1.startAt }
 
             let totalMinutes = daySessions.reduce(0) { $0 + $1.session.totalMinutes }
@@ -213,7 +228,8 @@ enum SleepInsights {
                 lightMinutes: lightMinutes,
                 deepMinutes: deepMinutes,
                 awakeMinutes: awakeMinutes,
-                blocks: blocks
+                blocks: blocks,
+                unstagedMinutes: unstagedMinutes
             ))
         }
 
@@ -233,8 +249,10 @@ enum SleepInsights {
         return Int((Double(total) / Double(valid.count)).rounded())
     }
 
+    /// Nights whose stages weren't measured are left out — their zero deep/light would drag the
+    /// averages down rather than describe anything.
     static func averageStages(_ valid: [SleepSummary]) -> (deep: Int, light: Int, awake: Int)? {
-        let valid = collapseByDay(valid)
+        let valid = collapseByDay(valid).filter { !$0.stagesUnmeasured }
         guard !valid.isEmpty else { return nil }
         let deep = valid.reduce(0) { $0 + $1.deepMinutes } / valid.count
         let light = valid.reduce(0) { $0 + $1.lightMinutes } / valid.count
@@ -271,8 +289,39 @@ enum SleepInsights {
         return nil
     }
 
+    /// Day view for a night recorded as asleep / awake only (no stage measurement): talk about
+    /// duration and wakefulness, never about a stage mix that wasn't measured.
+    static func unstagedDayCoach(_ sleep: SleepSummary, awakePct: Int?) -> SleepCoach {
+        let total = sleep.session.totalMinutes
+        let note = "Your ring records when you're asleep and awake but not the stage of sleep, "
+            + "so this night is shown as asleep and awake only."
+        var chips = ["Stages not measured"]
+        if total >= 420 && total <= 540 { chips.insert("Good duration", at: 0) }
+        if let awakePct, awakePct <= 10 { chips.append("Awake time low") }
+        if let awakePct, awakePct > 15 {
+            return SleepCoach(
+                headline: "Some restlessness",
+                body: "Awake time was a bit elevated. " + note,
+                chips: Array((["Awake time elevated"] + chips).prefix(3))
+            )
+        }
+        if total < 390 {
+            return SleepCoach(
+                headline: "Short night",
+                body: "Total sleep time was short for a full recovery window. " + note,
+                chips: Array((["Short duration"] + chips).prefix(3))
+            )
+        }
+        return SleepCoach(
+            headline: "Steady night",
+            body: note + " The score is based on duration and awake time.",
+            chips: Array(chips.prefix(3))
+        )
+    }
+
     /// Day view with a real session.
     static func dayCoach(_ sleep: SleepSummary, score: Int, awakePct: Int?, deepPct: Int, activitySteps: Int?) -> SleepCoach {
+        if sleep.stagesUnmeasured { return unstagedDayCoach(sleep, awakePct: awakePct) }
         var chips: [String] = []
         if sleep.session.totalMinutes >= 420 && sleep.session.totalMinutes <= 540 { chips.append("Good duration") }
         if deepPct >= 13 && deepPct <= 23 { chips.append("Deep sleep balanced") }

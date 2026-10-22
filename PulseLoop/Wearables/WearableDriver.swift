@@ -64,7 +64,7 @@ protocol WearableDriver: AnyObject {
     /// A GATT link has just come up. Auto-reconnect re-uses the *same* driver instance (only a fresh
     /// pairing rebuilds it), so any partially-reassembled frame or in-flight transfer left over from
     /// the dropped link must be discarded here or it corrupts the first frames of the new one.
-    /// Default: no-op (jring/Colmi carry no cross-connection reassembly state).
+    /// Default: no-op.
     func connectionDidStart()
 
     /// The GATT link has dropped. Clearing on the *next* connect is not enough for a driver whose state
@@ -72,6 +72,10 @@ protocol WearableDriver: AnyObject {
     /// write queue that the new link will happily flush *before* the handshake. Anything self-driving
     /// must be stopped here. Default: no-op.
     func connectionDidEnd()
+
+    /// The ring's Device Information firmware revision was read (each connect). For drivers whose
+    /// decoding depends on the firmware build. Default: no-op.
+    func firmwareRevisionDidUpdate(_ revision: String)
 
     /// Notify characteristics that must **all** be subscribed before the connection counts as up.
     ///
@@ -113,6 +117,7 @@ extension WearableDriver {
     func usesCommandChannel(for frame: Data) -> Bool { false }
     func connectionDidStart() {}
     func connectionDidEnd() {}
+    func firmwareRevisionDidUpdate(_ revision: String) {}
     /// Empty keeps the historical behaviour: the connection is up as soon as *any* notify characteristic
     /// starts notifying.
     var requiredSubscriptionsBeforeConnected: [CBUUID] { [] }

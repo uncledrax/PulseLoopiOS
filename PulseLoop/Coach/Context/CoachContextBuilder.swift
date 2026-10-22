@@ -87,15 +87,19 @@ enum CoachContextBuilder {
         )
 
         let sleep = summary.sleep.map { s -> CoachContextPacket.SleepContext in
-            CoachContextPacket.SleepContext(
+            let staged = !s.stagesUnmeasured
+            return CoachContextPacket.SleepContext(
                 date: localDate(s.session.date),
                 totalMin: s.session.totalMinutes,
-                deepMin: s.deepMinutes,
-                lightMin: s.lightMinutes,
+                deepMin: staged ? s.deepMinutes : nil,
+                lightMin: staged ? s.lightMinutes : nil,
+                asleepMin: staged ? nil : s.unstagedMinutes,
                 awakeMin: s.awakeMinutes,
+                stagesMeasured: staged,
                 score: s.session.score,
                 confidence: "medium",
-                decoderNote: DataQualityAnalyzer.sleepDecoderNote
+                decoderNote: staged ? DataQualityAnalyzer.sleepDecoderNote
+                    : "This ring records asleep / awake only; light, deep and REM sleep were not measured."
             )
         }
 

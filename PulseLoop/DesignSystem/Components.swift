@@ -418,11 +418,18 @@ struct SleepStageSummaryCardsView: View {
     let deep: String
     let light: String
     let awake: String
+    /// Set for a night recorded as asleep / awake only: shows Asleep and Awake instead of the stage
+    /// split, which wasn't measured.
+    var asleep: String? = nil
 
     var body: some View {
         HStack(spacing: 12) {
-            stat("\(prefix)Deep", deep, SleepStageColors.deep)
-            stat("\(prefix)Light", light, SleepStageColors.light)
+            if let asleep {
+                stat("\(prefix)Asleep", asleep, SleepStageColors.color(for: .unknown))
+            } else {
+                stat("\(prefix)Deep", deep, SleepStageColors.deep)
+                stat("\(prefix)Light", light, SleepStageColors.light)
+            }
             stat("\(prefix)Awake", awake, SleepStageColors.awake)
         }
     }
