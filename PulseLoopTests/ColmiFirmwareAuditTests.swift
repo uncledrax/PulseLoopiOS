@@ -169,6 +169,41 @@ final class UnstagedSleepPresentationTests: XCTestCase {
         XCTAssertFalse(summary.stagesUnmeasured)
     }
 
+    /// The coach is told what was measured: no deep / light minutes (not 0 of each) on an unstaged
+    /// night, the time asleep instead, and a flag saying why.
+    @MainActor
+    func testCoachContextLeavesOutUnmeasuredStages() throws {
+        let context = try TestSupport.makeContext()
+        let stages = Array(repeating: SleepStage.unknown, count: 460) + Array(repeating: .awake, count: 20)
+        TestSupport.insertSleep(nightStart: lastNight(), stages: stages, into: context)
+
+        let built = try XCTUnwrap(CoachSummaryContextBuilder.sleepDay(context: context, now: lastNight().addingTimeInterval(10 * 3600)))
+        // The summary encoder converts keys to snake_case.
+        XCTAssertFalse(built.json.contains("deep_min"), built.json)
+        XCTAssertFalse(built.json.contains("deep_pct"), built.json)
+        XCTAssertTrue(built.json.contains("\"stages_measured\":false"), built.json)
+        XCTAssertTrue(built.json.contains("\"asleep_min\":460"), built.json)
+
+        let sleep = try XCTUnwrap(CoachContextBuilder.build(context: context).latestSleep)
+        XCTAssertNil(sleep.deepMin)
+        XCTAssertNil(sleep.lightMin)
+        XCTAssertEqual(sleep.asleepMin, 460)
+        XCTAssertFalse(sleep.stagesMeasured)
+    }
+
+    @MainActor
+    func testCoachContextKeepsStagesOfAStagedNight() throws {
+        let context = try TestSupport.makeContext()
+        let stages = Array(repeating: SleepStage.light, count: 300) + Array(repeating: .deep, count: 90)
+            + Array(repeating: .awake, count: 30)
+        TestSupport.insertSleep(nightStart: lastNight(), stages: stages, into: context)
+        let sleep = try XCTUnwrap(CoachContextBuilder.build(context: context).latestSleep)
+        XCTAssertEqual(sleep.deepMin, 90)
+        XCTAssertEqual(sleep.lightMin, 300)
+        XCTAssertNil(sleep.asleepMin)
+        XCTAssertTrue(sleep.stagesMeasured)
+    }
+
     func testAverageStagesSkipUnstagedNights() throws {
         let context = try TestSupport.makeContext()
         TestSupport.insertSleep(nightStart: lastNight(), stages: Array(repeating: .unknown, count: 400), into: context)

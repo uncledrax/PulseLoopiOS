@@ -89,12 +89,16 @@ struct CoachContextPacket: Encodable {
         var peakHrToday: Double?
     }
 
+    /// `deepMin` / `lightMin` are nil — and `asleepMin` carries the time asleep — for a night recorded
+    /// as asleep / awake only (patched RY02KA firmware), whose stages were never measured.
     struct SleepContext: Encodable {
         var date: String
         var totalMin: Int
-        var deepMin: Int
-        var lightMin: Int
+        var deepMin: Int?
+        var lightMin: Int?
+        var asleepMin: Int?
         var awakeMin: Int
+        var stagesMeasured: Bool
         var score: Int?
         var confidence: String
         var decoderNote: String

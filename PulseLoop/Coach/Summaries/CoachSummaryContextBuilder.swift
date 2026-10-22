@@ -61,23 +61,30 @@ enum CoachSummaryContextBuilder {
         let activitySteps = MetricsRepository.latestActivity(context: context)?.steps
         let memories = CoachContextBuilder.build(context: context, now: now).memories
 
+        // A night recorded as asleep / awake only (patched RY02KA firmware) has no light / deep split:
+        // its stage fields are left out rather than sent as 0 minutes of deep sleep, and
+        // `stagesMeasured: false` says why.
         struct Packet: Encodable {
-            let date: String, totalMin: Int, deepMin: Int, lightMin: Int, awakeMin: Int
-            let score: Int, scoreLabel: String, awakePct: Int?, deepPct: Int, activitySteps: Int?
+            let date: String, totalMin: Int, deepMin: Int?, lightMin: Int?, asleepMin: Int?, awakeMin: Int
+            let stagesMeasured: Bool
+            let score: Int, scoreLabel: String, awakePct: Int?, deepPct: Int?, activitySteps: Int?
             let memories: [CoachContextPacket.MemoryContext]
             let environment: CoachContextPacket.EnvironmentContext?
         }
+        let staged = !night.stagesUnmeasured
         let p = Packet(
             date: CoachDataAccess.localDateString(night.session.date),
-            totalMin: night.session.totalMinutes, deepMin: night.deepMinutes,
-            lightMin: night.lightMinutes, awakeMin: night.awakeMinutes,
+            totalMin: night.session.totalMinutes,
+            deepMin: staged ? night.deepMinutes : nil, lightMin: staged ? night.lightMinutes : nil,
+            asleepMin: staged ? nil : night.unstagedMinutes, awakeMin: night.awakeMinutes,
+            stagesMeasured: staged,
             score: score.score, scoreLabel: score.label.rawValue, awakePct: score.awakePct,
-            deepPct: score.deepPct, activitySteps: activitySteps, memories: memories,
+            deepPct: staged ? score.deepPct : nil, activitySteps: activitySteps, memories: memories,
             environment: environment
         )
         let sig = signature([
             String(night.session.totalMinutes), String(night.deepMinutes),
-            String(night.lightMinutes), String(night.awakeMinutes), String(score.score),
+            String(night.lightMinutes), String(night.awakeMinutes), String(score.score), String(staged),
         ])
         let coach = SleepInsights.dayCoach(night, score: score.score, awakePct: score.awakePct,
                                            deepPct: score.deepPct, activitySteps: activitySteps)
@@ -100,14 +107,17 @@ enum CoachSummaryContextBuilder {
         let goalMin = MetricsRepository.goals(context: context)?.sleepMinutes
         let memories = CoachContextBuilder.build(context: context, now: now).memories
 
+        // Stage averages cover only nights whose stages were measured (`averageStages` skips the rest);
+        // `nightsWithoutStages` tells the coach how many nights they leave out.
         struct Packet: Encodable {
-            let range: String, nightsTracked: Int, expectedNights: Int
+            let range: String, nightsTracked: Int, expectedNights: Int, nightsWithoutStages: Int
             let avgTotalMin: Int?, avgScore: Int?
             let avgDeepMin: Int?, avgLightMin: Int?, avgAwakeMin: Int?, goalMin: Int?
             let memories: [CoachContextPacket.MemoryContext]
         }
         let p = Packet(
             range: range.rawValue, nightsTracked: valid.count, expectedNights: summary.expectedNights,
+            nightsWithoutStages: SleepInsights.collapseByDay(valid).filter(\.stagesUnmeasured).count,
             avgTotalMin: avgMin, avgScore: avgScore,
             avgDeepMin: stages?.deep, avgLightMin: stages?.light, avgAwakeMin: stages?.awake,
             goalMin: goalMin, memories: memories
