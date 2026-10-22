@@ -57,6 +57,11 @@ final class ColmiSyncEngine: RingSyncEngine {
     private var pagedHeader: ColmiPagedHistoryHeader?
     /// The midnight of the day currently being synced (for HR/stress/HRV sample timestamps).
     private var syncDay = Calendar.current.startOfDay(for: Date())
+    /// The paged-history opcode most recently requested — the one `syncDay` (and `pagedHeader`) belong
+    /// to. A page with this opcode can still be dated correctly after the watchdog has moved on to a
+    /// big-data stage, so it is decoded; a page with any other opcode can't be (HR pages carry no
+    /// date), so it is dropped. Only a page for the stage in flight advances the machine.
+    private var pagedOpcodeInFlight: UInt8?
     /// Set when a past stress day's packet 1 echoes a different day offset than we asked for — i.e. the
     /// firmware ignored the offset and is replaying another day. That day's samples are dropped and the
     /// stress walk-back stops, so nothing is filed under the wrong date.
@@ -128,6 +133,7 @@ final class ColmiSyncEngine: RingSyncEngine {
         stage = .idle
         daysAgo = 0
         pagedHeader = nil
+        pagedOpcodeInFlight = nil
         stressDayRejected = false
         isVitalsBackfill = false
         receivedReplyThisRun = false
@@ -290,11 +296,13 @@ final class ColmiSyncEngine: RingSyncEngine {
 
     private func requestActivity() {
         syncDay = dayStart(daysAgo)
+        pagedOpcodeInFlight = ColmiCommandID.syncActivity
         writer?.enqueue(Data(encoder.syncActivity(daysAgo: daysAgo)))
     }
 
     private func requestHeartRate() {
         syncDay = dayStart(daysAgo)
+        pagedOpcodeInFlight = ColmiCommandID.syncHeartRate
         pagedHeader = nil
         let unix = Int(syncDay.timeIntervalSince1970)
         writer?.enqueue(Data(encoder.syncHeartRate(fromUnix: unix)))
@@ -302,6 +310,7 @@ final class ColmiSyncEngine: RingSyncEngine {
 
     private func requestStress() {
         syncDay = dayStart(daysAgo)
+        pagedOpcodeInFlight = ColmiCommandID.syncStress
         pagedHeader = nil
         stressDayRejected = false
         writer?.enqueue(Data(encoder.syncStress(daysAgo: daysAgo)))
@@ -309,6 +318,7 @@ final class ColmiSyncEngine: RingSyncEngine {
 
     private func requestHRV() {
         syncDay = dayStart(daysAgo)
+        pagedOpcodeInFlight = ColmiCommandID.syncHRV
         pagedHeader = nil
         writer?.enqueue(Data(encoder.syncHRV(daysAgo: daysAgo)))
     }
@@ -326,29 +336,33 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// Decode a paged history frame for the current sync-day and advance the machine. Returns the
     /// decoded sample events for the bus.
     func handleHistoryFrame(_ data: Data) -> [RingDecodedEvent] {
-        // Only the stage in flight asked for this opcode. Anything else is a late reply to a stage the
-        // watchdog already skipped: it would be dated by *this* stage's day (HR pages carry no date), and
-        // its terminal page would advance this stage's day. Drop it.
-        guard let opcode = data.first, opcode == Self.historyOpcode(for: stage) else {
-            syncLog.info("history frame 0x\(String(format: "%02x", data.first ?? 0), privacy: .public) outside its stage; dropped")
+        // A page answers the last paged request, or it is a late reply to an earlier one whose day
+        // `syncDay` no longer holds (HR pages carry no date): that one is dropped.
+        guard let opcode = data.first, opcode == pagedOpcodeInFlight else {
+            syncLog.info("history frame 0x\(String(format: "%02x", data.first ?? 0), privacy: .public) for an earlier request; dropped")
             return []
         }
-        receivedReplyThisRun = true
+        if stage != .idle && stage != .done { receivedReplyThisRun = true }
+        // Only the stage in flight moves on: a late page after the watchdog went to a big-data stage is
+        // still decoded under its own day, but its terminal page must not advance anything.
+        let answersStage = opcode == Self.historyOpcode(for: stage)
         if let header = ColmiPagedHistoryHeader(data) { pagedHeader = header }
         let interval = (pagedHeader?.opcode == data.first) ? pagedHeader?.intervalMinutes : nil
         let bytes = [UInt8](data.prefix(3))
-        if stage == .stress, daysAgo > 0, bytes.count == 3, bytes[0] == ColmiCommandID.syncStress,
+        if opcode == ColmiCommandID.syncStress, daysAgo > 0, bytes.count == 3,
            bytes[1] == 1, bytes[2] != UInt8(clamping: daysAgo) {
             let echoed = Int(bytes[2])
             syncLog.info("stress day \(self.daysAgo) echoed offset \(echoed); firmware ignores the day offset")
             stressDayRejected = true
         }
-        let isRejectedStressDay = stage == .stress && stressDayRejected && data.first == ColmiCommandID.syncStress
+        let isRejectedStressDay = opcode == ColmiCommandID.syncStress && stressDayRejected
         let events = isRejectedStressDay
             ? []
             : decoder.decodeHistory(data, day: syncDay, calendar: calendar, intervalMinutes: interval)
-        advanceAfterPagedFrame(data)
-        armWatchdog()   // progress made — reset the stall timer
+        if answersStage {
+            advanceAfterPagedFrame(data)
+            armWatchdog()   // progress made — reset the stall timer
+        }
         return events
     }
 
@@ -357,8 +371,9 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// all-day SpO2 log a spot check fetches while no sync runs (`startSpO2`), is decoded by the driver
     /// like any other; letting it advance the machine would re-request a stage or start a run from idle.
     func handleBigDataComplete(type: UInt8) {
+        // Any big-data reply during a run is data the driver stored, so the run synced something.
+        if stage != .idle && stage != .done { receivedReplyThisRun = true }
         guard type == Self.bigDataType(for: stage) else { return }
-        receivedReplyThisRun = true
         switch type {
         case ColmiCommandID.bigDataSpo2:
             if isVitalsBackfill { finishSync(); return }

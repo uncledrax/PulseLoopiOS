@@ -135,6 +135,55 @@ final class ColmiLinkLifecycleTests: XCTestCase {
         XCTAssertEqual(requests(writer).count, sent + 1)
     }
 
+    func testLatePageAfterTheMoveToBigDataIsStillDatedToItsDay() {
+        // The last stress day (6) completes and the sync moves on to SpO2; a straggling page of that day
+        // is still decoded under day 6, and moves nothing.
+        let writer = RecordingWriter()
+        let engine = engine(writer)
+        engine.syncHistory()
+        for _ in 0...7 { _ = engine.handleHistoryFrame(empty(ColmiCommandID.syncActivity)) }
+        for _ in 0...7 { _ = engine.handleHistoryFrame(empty(ColmiCommandID.syncHeartRate)) }
+        for _ in 0..<ColmiSyncEngine.stressPastDays { _ = engine.handleHistoryFrame(empty(ColmiCommandID.syncStress)) }
+        let lastDay = [page([0x37, 0x00, 0x05, 0x1e]),
+                       page([0x37, 1, UInt8(ColmiSyncEngine.stressPastDays)] + Array(repeating: 40, count: 12)),
+                       page([0x37, 2] + Array(repeating: 40, count: 13)),
+                       page([0x37, 3] + Array(repeating: 40, count: 13)),
+                       page([0x37, 4] + Array(repeating: 40, count: 10))]
+        for frame in lastDay.dropFirst(2) { _ = engine.handleHistoryFrame(frame) }   // packets 2–4; 4 ends the day
+        XCTAssertEqual(requests(writer).last, ColmiCommandID.bigDataSpo2, "stress is done; SpO2 is in flight")
+        let sent = requests(writer).count
+
+        let late = engine.handleHistoryFrame(lastDay[1])   // packet 1 arrives last
+        let cal = Calendar.current
+        let day6 = cal.date(byAdding: .day, value: -ColmiSyncEngine.stressPastDays, to: cal.startOfDay(for: Date()))!
+        let stamps = late.compactMap { event -> Date? in if case .stressSample(_, let ts) = event { return ts }; return nil }
+        XCTAssertEqual(stamps.count, 12)
+        XCTAssertTrue(stamps.allSatisfy { cal.isDate($0, inSameDayAs: day6) })
+        XCTAssertEqual(requests(writer).count, sent, "a late page never advances a stage it isn't in")
+    }
+
+    func testLateBigDataReplyCountsAsAReply() async {
+        // A post-workout backfill whose HR request goes unanswered, while a sleep reply (asked for by an
+        // earlier run) lands: the driver stored it, so the run is "done", not "incomplete".
+        let writer = RecordingWriter()
+        let engine = engine(writer, watchdogNanoseconds: 5_000_000)
+        engine.startVitalsBackfill()
+        engine.handleBigDataComplete(type: ColmiCommandID.bigDataSleep)
+        await waitUntil(seconds: 5) { engine.lastRunOutcome != nil }
+        XCTAssertEqual(engine.lastRunOutcome, "done")
+    }
+
+    func testNothingIsQueuedForTheStreamsAfterDisconnect() {
+        let writer = RecordingWriter()
+        let engine = engine(writer)
+        engine.startHeartRate()
+        engine.measureHeartRateSpot()
+        engine.connectionDidEnd()
+        let sent = writer.frames.count
+        engine.stopHeartRate()   // a workout or spot measurement ending after the link dropped
+        XCTAssertEqual(writer.frames.count, sent, "the streams ended with the link; there is nothing to stop")
+    }
+
     func testLateBigDataReplyDoesNotRerequestAStage() {
         let writer = RecordingWriter()
         let engine = engine(writer)

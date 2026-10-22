@@ -283,6 +283,8 @@ final class EventPersistenceSubscriber {
     private func applyPersist(_ event: PulseEvent) {
         switch event {
         case let .deviceStateChanged(state, address):
+            // A run the link cut off never sends "done"; settle what it did store before the next one.
+            if state == .disconnected { endInterruptedSync() }
             let device = MetricsService.fetchDevices(context).first ?? Device()
             device.state = state
             device.bleAddressHint = address ?? device.bleAddressHint
@@ -434,6 +436,9 @@ final class EventPersistenceSubscriber {
                 // Recompute calorie estimates for every day this sync touched, in one pass — the
                 // batched flush below saves the writes and fires the coalesced change signal.
                 DailyCalorieEstimator.flushDirty(context: context)
+            } else if stage == "incomplete" {
+                // A run that got no reply: not a finished sync (no `lastFullSyncAt`), but it is over.
+                endInterruptedSync()
             }
         case let .rwfitSyncOutcome(outcome):
             if case .success = outcome, let device = DeviceRepository.current(context: context) {
@@ -473,6 +478,18 @@ final class EventPersistenceSubscriber {
             confidence: .known,
             context: context
         )
+    }
+
+    /// End-of-sync housekeeping for a run that ended without `"done"` (cut off by the link, or answered
+    /// by nothing). Save the batch first: `isDuplicateHistory`'s in-memory tier is what stops a re-sent
+    /// sample from being inserted twice while its first insert is still unsaved, so the keys can only go
+    /// once the rows are committed. Then the next run re-checks against the database (updating a value
+    /// the ring revised instead of skipping it), and the days this run touched get their calorie
+    /// estimates recomputed now rather than at some later "done".
+    private func endInterruptedSync() {
+        flushNow()
+        seenHistoryKeys.removeAll(keepingCapacity: true)
+        DailyCalorieEstimator.flushDirty(context: context)
     }
 
     /// True when this history sample is already stored (updating the existing row's value in place).

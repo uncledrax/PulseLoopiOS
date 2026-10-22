@@ -836,6 +836,11 @@ extension RingBLEClient: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         MainActor.assumeIsolated {
             peripheral.delegate = self
+            // Anything queued while there was no link belongs to the one that dropped — e.g. the stop
+            // command of a spot measurement the disconnect aborted (`enqueueWrite` accepts writes with no
+            // link). Auto-reconnect doesn't pass through `beginConnect`, so clear it here, or it would be
+            // the first thing this link writes, ahead of its handshake.
+            cancelPendingWrites()
             // Auto-reconnect keeps the existing driver, so tell it the link is new: anything half-read
             // when the old link dropped (a partial frame, an in-flight history transfer) must go.
             activeDriver?.connectionDidStart()
