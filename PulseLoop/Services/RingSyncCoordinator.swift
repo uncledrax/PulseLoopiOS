@@ -898,6 +898,10 @@ final class RingSyncCoordinator {
     /// `syncHistory()` is a no-op on jring/Colmi) keeps the label honest for the families whose history
     /// only comes down with the connect handshake.
     private func updateSync(stage: String) {
+        // `"incomplete"`: a run that ended without the ring answering anything (Colmi's stage watchdog
+        // walked it to the end). It ends the bar like "done", but no data was handed over, so it
+        // stamps nothing — neither "Synced Xm ago" here nor `lastFullSyncAt` in the event bus.
+        guard stage != "incomplete" else { endSync(); return }
         if client.activeDeviceType != .rwfit { lastSyncAt = Date() }
         guard stage != "done" else { endSync(); return }
         syncStage = stage

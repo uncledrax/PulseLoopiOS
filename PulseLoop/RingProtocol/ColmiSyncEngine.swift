@@ -66,12 +66,71 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// A targeted post-workout run: today's HR log → SpO2 big-data → done, skipping the other five
     /// stages. Set by `startVitalsBackfill()`, cleared whenever a run finishes or a full sync starts.
     private var isVitalsBackfill = false
+    /// Whether the ring has answered anything in the current run (a history page, an empty-day
+    /// marker, or a big-data reply for the stage in flight). A run the stage watchdog walked to the
+    /// end with no reply at all synced nothing, so it must not be reported as a finished sync.
+    private var receivedReplyThisRun = false
+    /// How the last run ended — the `.syncProgress` sentinel `finishSync` published (`"done"` or
+    /// `"incomplete"`). nil until a run finishes; an interrupted run doesn't finish.
+    private(set) var lastRunOutcome: String?
 
     static func isHistoryOpcode(_ op: UInt8) -> Bool {
         op == ColmiCommandID.syncActivity
             || op == ColmiCommandID.syncHeartRate
             || op == ColmiCommandID.syncStress
             || op == ColmiCommandID.syncHRV
+    }
+
+    /// The paged-history opcode a stage requests; nil for stages that page nothing.
+    private static func historyOpcode(for stage: Stage) -> UInt8? {
+        switch stage {
+        case .activity: return ColmiCommandID.syncActivity
+        case .heartRate: return ColmiCommandID.syncHeartRate
+        case .stress: return ColmiCommandID.syncStress
+        case .hrv: return ColmiCommandID.syncHRV
+        case .idle, .spo2, .sleep, .temperature, .done: return nil
+        }
+    }
+
+    /// The big-data type a stage requests; nil for the paged stages.
+    private static func bigDataType(for stage: Stage) -> UInt8? {
+        switch stage {
+        case .spo2: return ColmiCommandID.bigDataSpo2
+        case .sleep: return ColmiCommandID.bigDataSleep
+        case .temperature: return ColmiCommandID.bigDataTemperature
+        case .idle, .activity, .heartRate, .stress, .hrv, .done: return nil
+        }
+    }
+
+    // MARK: - Link lifecycle
+
+    /// Auto-reconnect reuses this engine, so a run cut off by the previous link must not carry over.
+    func connectionDidStart() {
+        stopLinkWork()
+    }
+
+    /// The link dropped. Stop everything self-driving *now*: the stage watchdog would otherwise keep
+    /// stepping through the reconnect gap, queueing a history request every 10 s and finally reporting
+    /// a sync that never happened, and the realtime-HR keepalive would keep queueing its continue
+    /// command. Nothing is published: an interrupted run did not finish (the coordinator ends its
+    /// progress bar on the disconnect itself), and a workout's stream is restarted on reconnect.
+    func connectionDidEnd() {
+        stopLinkWork()
+    }
+
+    private func stopLinkWork() {
+        watchdog?.cancel()
+        watchdog = nil
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        realtimeHRActive = false
+        manualHRActive = false
+        stage = .idle
+        daysAgo = 0
+        pagedHeader = nil
+        stressDayRejected = false
+        isVitalsBackfill = false
+        receivedReplyThisRun = false
     }
 
     func runStartup() {
@@ -145,6 +204,7 @@ final class ColmiSyncEngine: RingSyncEngine {
         daysAgo = 0
         stage = .activity
         isVitalsBackfill = false
+        receivedReplyThisRun = false
         // Zero the ring-history activity days we're about to re-sum, so re-syncs stay idempotent.
         Task { await PulseEventBus.shared.publish(.activitySyncReset(sinceDaysAgo: 7)) }
         requestActivity()
@@ -167,6 +227,7 @@ final class ColmiSyncEngine: RingSyncEngine {
     func startVitalsBackfill() {
         guard stage == .idle || stage == .done else { return }
         isVitalsBackfill = true
+        receivedReplyThisRun = false
         daysAgo = 0
         stage = .heartRate
         requestHeartRate()
@@ -179,8 +240,9 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// the next stage instead of stalling the whole chain. Re-armed on every stage request; cancelled
     /// on each advance and on disconnect/finish.
     private var watchdog: Task<Void, Never>?
-    private let watchdogTimeout: UInt64 = 10_000_000_000          // 10s for most stages
-    private let activityWatchdogTimeout: UInt64 = 20_000_000_000  // 20s — activity spans 8 days, can be slow
+    // Not `private` so tests can shorten them.
+    var watchdogTimeout: UInt64 = 10_000_000_000          // 10s for most stages
+    var activityWatchdogTimeout: UInt64 = 20_000_000_000  // 20s — activity spans 8 days, can be slow
 
     private func armWatchdog() {
         watchdog?.cancel()
@@ -264,6 +326,14 @@ final class ColmiSyncEngine: RingSyncEngine {
     /// Decode a paged history frame for the current sync-day and advance the machine. Returns the
     /// decoded sample events for the bus.
     func handleHistoryFrame(_ data: Data) -> [RingDecodedEvent] {
+        // Only the stage in flight asked for this opcode. Anything else is a late reply to a stage the
+        // watchdog already skipped: it would be dated by *this* stage's day (HR pages carry no date), and
+        // its terminal page would advance this stage's day. Drop it.
+        guard let opcode = data.first, opcode == Self.historyOpcode(for: stage) else {
+            syncLog.info("history frame 0x\(String(format: "%02x", data.first ?? 0), privacy: .public) outside its stage; dropped")
+            return []
+        }
+        receivedReplyThisRun = true
         if let header = ColmiPagedHistoryHeader(data) { pagedHeader = header }
         let interval = (pagedHeader?.opcode == data.first) ? pagedHeader?.intervalMinutes : nil
         let bytes = [UInt8](data.prefix(3))
@@ -282,8 +352,13 @@ final class ColmiSyncEngine: RingSyncEngine {
         return events
     }
 
-    /// A reassembled big-data frame completed (`type` = 0x25/0x27/0x2a). Advance to the next stage.
+    /// A reassembled big-data frame completed (`type` = 0x25/0x27/0x2a). Advance to the next stage — but
+    /// only when it answers the stage in flight. A late SpO2 reply after the watchdog moved on, or the
+    /// all-day SpO2 log a spot check fetches while no sync runs (`startSpO2`), is decoded by the driver
+    /// like any other; letting it advance the machine would re-request a stage or start a run from idle.
     func handleBigDataComplete(type: UInt8) {
+        guard type == Self.bigDataType(for: stage) else { return }
+        receivedReplyThisRun = true
         switch type {
         case ColmiCommandID.bigDataSpo2:
             if isVitalsBackfill { finishSync(); return }
@@ -362,12 +437,18 @@ final class ColmiSyncEngine: RingSyncEngine {
         }
     }
 
+    /// End the run. `"done"` is what stamps `Device.lastFullSyncAt` and wakes the coach, so it is only
+    /// published when the ring answered something; a run the watchdog walked through in silence (a
+    /// link that died without iOS noticing yet) ends with `"incomplete"`, which only clears the bar.
     private func finishSync() {
         stage = .done
         isVitalsBackfill = false
         watchdog?.cancel()
         watchdog = nil
-        Task { await PulseEventBus.shared.publish(.syncProgress(stage: "done")) }
+        let outcome = receivedReplyThisRun ? "done" : "incomplete"
+        lastRunOutcome = outcome
+        if !receivedReplyThisRun { syncLog.info("history run ended with no reply from the ring") }
+        Task { await PulseEventBus.shared.publish(.syncProgress(stage: outcome)) }
     }
 
     // MARK: Realtime HR keepalive

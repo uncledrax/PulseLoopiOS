@@ -64,7 +64,7 @@ protocol WearableDriver: AnyObject {
     /// A GATT link has just come up. Auto-reconnect re-uses the *same* driver instance (only a fresh
     /// pairing rebuilds it), so any partially-reassembled frame or in-flight transfer left over from
     /// the dropped link must be discarded here or it corrupts the first frames of the new one.
-    /// Default: no-op (jring/Colmi carry no cross-connection reassembly state).
+    /// Default: no-op.
     func connectionDidStart()
 
     /// The GATT link has dropped. Clearing on the *next* connect is not enough for a driver whose state

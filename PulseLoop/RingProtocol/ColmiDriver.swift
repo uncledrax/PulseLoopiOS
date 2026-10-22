@@ -57,6 +57,19 @@ final class ColmiDriver: WearableDriver {
     /// here, in either order; only a match sets it, so the other string can't clear it.
     func connectionDidStart() {
         decoder.sleepStagesUnmeasured = false
+        discardPartialBigData()
+    }
+
+    /// A big-data reply cut off by the link is never completed: drop it, or the next link's first
+    /// continuation chunk would be appended to it. (The sync engine stops itself; the client calls it
+    /// separately.)
+    func connectionDidEnd() {
+        discardPartialBigData()
+    }
+
+    private func discardPartialBigData() {
+        bigDataBuffers.removeAll()
+        activeBigDataType = nil
     }
 
     func firmwareRevisionDidUpdate(_ revision: String) {
